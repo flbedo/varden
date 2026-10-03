@@ -1,0 +1,6 @@
+pymorphy3
+Telethon
+xgboost
+sentence-transformers
+httpx[socks]
+python-socks[asyncio]
