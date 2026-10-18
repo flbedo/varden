@@ -61,9 +61,22 @@ def get_id_data(f_name: str, id) -> Union[Dict[str, Any], None]:
             
         # Оптимизированное преобразование значений
         return {
-            item: _parse_value(value) 
+            item: _parse_value(value)
             for item, value in rows
         }
+
+def get_ids_data(f_name: str, id_prefix: str = '') -> Dict[str, Dict[str, Any]]:
+    """Load all records whose IDs start with ``id_prefix`` in one query."""
+    with _get_connection(f_name) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT id, item, value FROM data WHERE substr(id, 1, ?) = ?',
+            (len(id_prefix), id_prefix),
+        )
+        records = {}
+        for record_id, item, value in cursor.fetchall():
+            records.setdefault(record_id, {})[item] = _parse_value(value)
+        return records
 
 def get_item_data(f_name: str, id, item: str) -> Any:
     conn = sqlite3.connect(f'{f_name}.db')

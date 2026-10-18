@@ -55,24 +55,25 @@ def load_training_samples() -> list[tuple[str, int]]:
 
 def train_model() -> None:
     samples = load_training_samples()
+
     rows = []
-    for text, _ in samples:
+    labels = []
+
+    for text, label in samples:
         extracted = extract_features(text)
         rows.append([extracted[name] for name in FEATURE_NAMES])
+        labels.append(label)
 
-    labels = [label for _, label in samples]
-    data = xgb.DMatrix(rows, label=labels, feature_names=FEATURE_NAMES)
-
-    model = xgb.train(
-        {
-            "objective": "binary:logistic",
-            "eval_metric": "logloss",
-            "max_depth": 3,
-            "eta": 0.2,
-        },
-        data,
-        num_boost_round=30,
+    model = xgb.XGBClassifier(
+        objective="binary:logistic",
+        eval_metric="logloss",
+        max_depth=3,
+        learning_rate=0.2,
+        n_estimators=30,
     )
+
+    model.fit(rows, labels)
+
     model.save_model(MODEL_PATH)
     print(f"Модель обучена на {len(samples)} примерах и сохранена: {MODEL_PATH}")
 

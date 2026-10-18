@@ -3,3 +3,5 @@
 *.db
 *.out
 .env
+*.pyc
+__pycache__/

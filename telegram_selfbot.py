@@ -1,4 +1,7 @@
+import asyncio
 import os
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import easydata as ed
@@ -14,7 +17,24 @@ API_HASH = os.environ["VCC_TELEGRAM_API_HASH"]
 
 DB_NAME = str(Path(__file__).with_name("varden_data"))
 SETTINGS_ID = "settings"
+SUMMARY_DEFAULT_HOURS = 24
+SUMMARY_MAX_HOURS = 24 * 7
+TELEGRAM_TEXT_LIMIT = 4_000
+AI_REPLY_COOLDOWN = 30
+AI_WARNING = "⚠️ Следующее сообщение — автоматический ответ ИИ и может содержать ошибки."
 ed.create_database(DB_NAME)
+
+SUMMARY_MODEL_MODE = str(
+    ed.get_item_data(DB_NAME, SETTINGS_ID, "summary_model_mode") or "fast"
+).lower()
+if SUMMARY_MODEL_MODE not in {"fast", "middle", "quality"}:
+    SUMMARY_MODEL_MODE = "fast"
+
+saved_ai_replies = ed.get_item_data(DB_NAME, SETTINGS_ID, "ai_replies_enabled")
+AI_REPLIES_ENABLED = saved_ai_replies if isinstance(saved_ai_replies, bool) else True
+AI_REPLY_BUSY = set()
+AI_REPLY_LAST_TIME = {}
+AI_REPLY_MESSAGES = {}
 
 
 def load_values(name):
@@ -29,7 +49,7 @@ def save_values(name, values):
 
 
 # В Telethon "me" означает чат «Избранное». Канал можно указать как @username или числовой Telegram ID.
-IMPORTANT_CHAT = ed.get_item_data(DB_NAME, SETTINGS_ID, "important_chat") or "me"
+IMPORTANT_CHAT = ed.get_item_data(DB_NAME, SETTINGS_ID, "important_chat")
 PROCESSED_SOURCES = {
     item.lower().removeprefix("@") for item in load_values("processed_sources")
 }
@@ -65,15 +85,62 @@ def normalize_source_id(value):
 
 
 def command(name):
-    """Создать декоратор для исходящей self-команды ``.name [текст]``."""
+    """Создать декоратор для исходящей self-команды ``#name [текст]``."""
     # pattern — регулярное выражение. Первая группа (.+) содержит аргумент после
-    # команды. Например, для «.note купить молоко» это «купить молоко».
-    pattern = rf"^:{name}(?:\s+(.+))?$"
+    # команды. Например, для «#note купить молоко» это «купить молоко».
+    pattern = rf"^#{name}(?:\s+(.+))?$"
 
     # client.on(...) возвращает декоратор, который регистрирует функцию ниже как
     # обработчик Telethon. outgoing=True пропускает только сообщения, отправленные
-    # нашим аккаунтом: чужое входящее сообщение «.note ...» команду не запустит.
+    # нашим аккаунтом: чужое входящее сообщение «#note ...» команду не запустит.
     return client.on(events.NewMessage(outgoing=True, pattern=pattern))
+
+
+def split_text(text, limit=TELEGRAM_TEXT_LIMIT):
+    """Разбить длинный ответ на допустимые для Telegram части."""
+    parts = []
+    remaining = text.strip()
+    while len(remaining) > limit:
+        split_at = remaining.rfind("\n\n", 0, limit + 1)
+        if split_at <= 0:
+            split_at = limit
+        parts.append(remaining[:split_at].strip())
+        remaining = remaining[split_at:].strip()
+    if remaining:
+        parts.append(remaining)
+    return parts
+
+
+def format_summary_results(results, hours):
+    """Подготовить результат секретаря для Telegram."""
+    sections = (
+        ("tasks", "Задачи"),
+        ("events", "Мероприятия"),
+        ("messages", "Важные сообщения"),
+    )
+    blocks = [f"Секретарь за последние {hours} ч."]
+
+    for category, title in sections:
+        lines = []
+        for item in results.get(category, []):
+            links = {
+                link["message_id"]: link["url"]
+                for link in item.get("message_links", [])
+            }
+            sources = []
+            for message_id in item["message_ids"]:
+                if message_id in links:
+                    sources.append(f"[{message_id}]({links[message_id]})")
+                else:
+                    sources.append(str(message_id))
+            lines.append(
+                f"• {item['text']}\n"
+                f"  Автор: {item['author_id']}; сообщения: {', '.join(sources)}"
+            )
+        if lines:
+            blocks.append(f"{title}:\n" + "\n".join(lines))
+
+    return "\n\n".join(blocks) if len(blocks) > 1 else ""
 
 
 def get_topic_id(event):
@@ -165,6 +232,62 @@ async def send_to_source(source, text):
     return await client.send_message(source["id"], text, reply_to=source["topic_id"])
 
 
+async def send_ai_reply(event):
+    """Ответить в личном чате через RAG с простым антиспамом."""
+    if (
+        not AI_REPLIES_ENABLED
+        or not event.is_private
+        or not (event.raw_text or "").strip()
+    ):
+        return
+
+    sender = await event.get_sender()
+    if getattr(sender, "bot", False):
+        return
+
+    chat_id = event.chat_id
+    now = time.monotonic()
+    if chat_id in AI_REPLY_BUSY:
+        return
+    if now - AI_REPLY_LAST_TIME.get(chat_id, 0) < AI_REPLY_COOLDOWN:
+        return
+
+    AI_REPLY_BUSY.add(chat_id)
+    AI_REPLY_LAST_TIME[chat_id] = now
+    warning = None
+
+    try:
+        from deputy import answer_question
+        from summary import OLLAMA_MODELS
+
+        warning = await client.send_message(chat_id, AI_WARNING, reply_to=event.id)
+        answer = await asyncio.to_thread(
+            answer_question,
+            DB_NAME,
+            event.raw_text,
+            OLLAMA_MODELS[SUMMARY_MODEL_MODE],
+            event.chat_id,
+            event.id,
+        )
+        if not AI_REPLIES_ENABLED:
+            await client.delete_messages(chat_id, [warning.id])
+            AI_REPLY_LAST_TIME.pop(chat_id, None)
+            return
+        reply = await client.send_message(
+            chat_id,
+            answer[:TELEGRAM_TEXT_LIMIT],
+            reply_to=event.id,
+        )
+        AI_REPLY_MESSAGES[chat_id] = [warning.id, reply.id]
+    except Exception as error:
+        print(f"[deputy] {type(error).__name__}: {error}")
+        AI_REPLY_LAST_TIME.pop(chat_id, None)
+        if warning is not None:
+            await client.delete_messages(chat_id, [warning.id])
+    finally:
+        AI_REPLY_BUSY.discard(chat_id)
+
+
 async def forward_to_destination(chat_id, topic_id, message): # Костыльная функция, потому что Telethon не умеет пересылать в топик форума напрямую.
     """Переслать сообщение, сохранив автора и выбранный forum topic."""
     if topic_id is None:
@@ -201,6 +324,7 @@ async def process_message(kind, event, source):
         {
             "message_id": event.id,
             "source_id": source["id"],
+            "source_username": source["username"],
             "topic_id": source["topic_id"],
             "author_id": source["author_id"],
             "text": event.raw_text,
@@ -238,7 +362,7 @@ async def test(event):
     author_id = await get_replied_author_id(event)
 
     if source_id is None or author_id is None:
-        await event.edit("Ответьте командой .test на сообщение")
+        await event.edit("Ответьте командой #test на сообщение")
         return
 
     analysis = analyze_message(message.raw_text)
@@ -262,13 +386,17 @@ async def important(event):
 
 @command("note")
 async def note(event):
-    """Пример команды с аргументом: ``.note купить молоко``."""
+    """Пример команды с аргументом: ``#note купить молоко``."""
     # pattern_match — результат сопоставления команды с регулярным выражением из
-    # command(). group(1) возвращает первую группу (.+), то есть текст после .note.
-    text = event.pattern_match.group(1)
-    if not text:
-        await event.edit("Использование: .note текст")
-        return
+    # command(). group(1) возвращает первую группу (.+), то есть текст после #note.
+    message = await event.get_reply_message() # подсасываем сообщение, на которое ответили командой
+    if message is None:
+        text = event.pattern_match.group(1)
+        if not text:
+            await event.edit("Использование: #note текст")
+            return
+    else:
+        text = message.raw_text
 
     await client.send_message("me", text)
     await event.delete()
@@ -281,7 +409,7 @@ async def relevant(event):
     author_id = await get_replied_author_id(event)
 
     if source_id is None or author_id is None:
-        await event.edit("Ответьте командой .relevant на сообщение с доступным источником")
+        await event.edit("Ответьте командой #relevant на сообщение с доступным источником")
         return
 
     if ed.is_id_exist(DB_NAME, f"message:{author_id}:{event.id}"):
@@ -294,6 +422,9 @@ async def relevant(event):
             {
                 "message_id": message.id,
                 "source_id": message.chat_id,
+                "source_username": getattr(
+                    getattr(message, "chat", None), "username", None
+                ),
                 "topic_id": getattr(message, "reply_to_msg_id", None),
                 "author_id": author_id,
                 "text": message.raw_text,
@@ -316,7 +447,7 @@ async def trash(event):
     author_id = await get_replied_author_id(event)
 
     if source_id is None or author_id is None:
-        await event.edit("Ответьте командой .trash на сообщение с доступным источником")
+        await event.edit("Ответьте командой #trash на сообщение с доступным источником")
         return
 
     if ed.is_id_exist(DB_NAME, f"message:{author_id}:{event.id}"):
@@ -329,6 +460,9 @@ async def trash(event):
             {
                 "message_id": message.id,
                 "source_id": message.chat_id,
+                "source_username": getattr(
+                    getattr(message, "chat", None), "username", None
+                ),
                 "topic_id": getattr(message, "reply_to_msg_id", None),
                 "author_id": author_id,
                 "text": message.raw_text,
@@ -355,6 +489,124 @@ async def train(event):
     await event.edit("Модель важности перезагружена")
 
 
+@command("model")
+async def summary_model_command(event):
+    """Показать или переключить модель секретаря."""
+    global SUMMARY_MODEL_MODE
+
+    from summary import OLLAMA_MODELS
+
+    value = event.pattern_match.group(1)
+    if not value:
+        model = OLLAMA_MODELS[SUMMARY_MODEL_MODE]
+        await event.edit(f"Режим: {SUMMARY_MODEL_MODE} ({model})")
+        return
+
+    mode = value.strip().lower()
+    if mode not in OLLAMA_MODELS:
+        modes = "|".join(OLLAMA_MODELS)
+        await event.edit(f"Использование: #summarymodel {modes}")
+        return
+
+    SUMMARY_MODEL_MODE = mode
+    ed.give_item_data(DB_NAME, SETTINGS_ID, "summary_model_mode", mode)
+    await event.edit(f"Режим переключён на {mode} ({OLLAMA_MODELS[mode]})")
+
+
+@command("aiundo")
+async def undo_ai_reply(event):
+    """Удалить последний ИИ-ответ и предупреждение в текущем чате."""
+    message_ids = AI_REPLY_MESSAGES.pop(event.chat_id, None)
+    if not message_ids:
+        await event.edit("В этом чате нет ИИ-ответа для отката")
+        return
+
+    await client.delete_messages(event.chat_id, message_ids)
+    AI_REPLY_LAST_TIME.pop(event.chat_id, None)
+    await event.delete()
+
+
+@command("autoreply")
+async def autoreply_command(event):
+    """Показать, включить или отключить ИИ-автоответы."""
+    global AI_REPLIES_ENABLED
+
+    value = event.pattern_match.group(1)
+    if not value:
+        state = "включены" if AI_REPLIES_ENABLED else "отключены"
+        await event.edit(f"ИИ-автоответы {state}; они работают только в личных чатах")
+        return
+
+    value = value.strip().lower()
+    if value not in {"on", "off"}:
+        await event.edit("Использование: #autoreply on или #autoreply off")
+        return
+
+    AI_REPLIES_ENABLED = value == "on"
+    AI_REPLY_LAST_TIME.clear()
+    ed.give_item_data(
+        DB_NAME,
+        SETTINGS_ID,
+        "ai_replies_enabled",
+        AI_REPLIES_ENABLED,
+    )
+    state = "включены" if AI_REPLIES_ENABLED else "отключены"
+    await event.edit(f"ИИ-автоответы {state}; они работают только в личных чатах")
+
+
+@command("summary")
+async def summary_command(event):
+    """Собрать задачи, мероприятия и важные сообщения за период."""
+    value = event.pattern_match.group(1)
+    try:
+        hours = int(value.strip()) if value else SUMMARY_DEFAULT_HOURS
+    except ValueError:
+        await event.edit("Использование: #summary [число часов]")
+        return
+
+    if not 1 <= hours <= SUMMARY_MAX_HOURS:
+        await event.edit(f"Укажите период от 1 до {SUMMARY_MAX_HOURS} часов")
+        return
+
+    from summary import OLLAMA_MODELS
+
+    model = OLLAMA_MODELS[SUMMARY_MODEL_MODE]
+    await event.edit(
+        f"Секретарь ({SUMMARY_MODEL_MODE}, {model}) разбирает сообщения "
+        f"за последние {hours} ч..."
+    )
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(hours=hours)
+
+    try:
+        from summary import load_messages, summarize_messages
+
+        messages = await asyncio.to_thread(load_messages, DB_NAME, start, end)
+        results = await asyncio.to_thread(summarize_messages, messages, model)
+    except Exception as error:
+        print(f"[summary] {type(error).__name__}: {error}")
+        await event.edit(
+            "Не удалось собрать сводку. Проверьте, что Ollama запущена "
+            "и модель доступна."
+        )
+        return
+
+    text = format_summary_results(results, hours)
+    if not text:
+        await event.edit(f"За последние {hours} ч. задач и важных событий не найдено")
+        return
+
+    parts = split_text(text)
+    await event.edit(parts[0], link_preview=False)
+    for part in parts[1:]:
+        await client.send_message(
+            event.chat_id,
+            part,
+            reply_to=get_topic_id(event),
+            link_preview=False,
+        )
+
+
 @command("source")
 async def source_status(event):
     source = await get_source(event)
@@ -371,7 +623,7 @@ async def watch_source(event):
     print(f"watch_source: source_id={source_id} author_id={author_id}")
     topic_id = get_topic_id(event)
     if source_id is None or author_id is None:
-        await event.edit("Ответьте командой .watch на сообщение с доступным источником")
+        await event.edit("Ответьте командой #watch на сообщение с доступным источником")
         return
 
     PROCESSED_SOURCES.add(f'{source_id}:{topic_id}' if topic_id else str(source_id))
@@ -383,16 +635,16 @@ async def watch_source(event):
 
 @command("addid")
 async def add_source_id(event):
-    """Добавить ID источника вручную: ``.addid ID[:TOPIC_ID]``."""
+    """Добавить ID источника вручную: ``#addid ID[:TOPIC_ID]``."""
     value = event.pattern_match.group(1)
     if not value:
-        await event.edit("Использование: .addid ID или .addid ID:TOPIC_ID")
+        await event.edit("Использование: #addid ID или #addid ID:TOPIC_ID")
         return
 
     try:
         source_id = normalize_source_id(value)
     except ValueError:
-        await event.edit("Некорректный ID. Использование: .addid ID или .addid ID:TOPIC_ID")
+        await event.edit("Некорректный ID. Использование: #addid ID или #addid ID:TOPIC_ID")
         return
 
     if source_id in PROCESSED_SOURCES:
@@ -410,7 +662,7 @@ async def set_important_chat(event):
     source_id = await get_replied_source_id(event)
     topic_id = get_topic_id(event)
     if source_id is None:
-        await event.edit("Ответьте командой .setimportant на сообщение с доступным источником")
+        await event.edit("Ответьте командой #setimportant на сообщение с доступным источником")
         return
 
     IMPORTANT_CHAT = f"{source_id}:{topic_id}" if topic_id else str(source_id)
@@ -422,6 +674,8 @@ async def set_important_chat(event):
 @client.on(events.NewMessage(incoming=True))
 async def incoming_message(event):
     await process_message("new", event, await get_source(event))
+    if event.is_private:
+        await send_ai_reply(event)
 
 
 @client.on(events.MessageEdited(incoming=True))
@@ -438,7 +692,11 @@ async def edited_message(event):
 
 
 if __name__ == "__main__":
-    print("Selfbot запущен. Команды: .ping, .important, .note, .source, .watch, .addid, .setimportant, .trash, .train")
+    print(
+        "Selfbot запущен. Команды: #ping, #important, #note, #source, "
+        "#watch, #addid, #setimportant, #trash, #train, #summary [часы], "
+        "#summarymodel fast|middle|quality, #autoreply on|off, #aiundo"
+    )
     print(f"Подключение к Telegram: {describe_telethon_proxy(TELEGRAM_PROXY)}")
     client.start()
 
